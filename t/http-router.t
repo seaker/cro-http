@@ -2069,4 +2069,25 @@ throws-like { bad-request }, X::Cro::HTTP::Router::OnlyInHandler, what => 'bad-r
         is $mark, '12345', 'The around blocks are called in top-to-bottom order';
     }
 }
+
+{
+    my $app = route {
+        put -> 'user',  uint32 $id {
+            request-body -> (:$state!, :$comment, *%rest) {
+                 # put user
+            }
+        }
+    }
+    my $source = Supplier.new;
+    my $responses = $app.transformer($source.Supply).Channel;
+    my $req = Cro::HTTP::Request.new(method => 'PUT', target => '/user/20',
+                                     content-type => 'text/plain',
+                                     body => {"state" => "HOM", "comment" => "test"});
+    $source.emit($req);
+    given $responses.receive -> $r {
+        is $r.status, 400, 'Recieved proper status for the case where a capture cannot be unpacked for whatever reason';
+    }
+    
+}
+
 done-testing;
