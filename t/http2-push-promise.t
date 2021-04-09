@@ -1,16 +1,16 @@
 use Cro::HTTP::Client;
 use Cro::HTTP::Router;
 use Cro::HTTP::Server;
-use Cro::TLS;
+use Cro::TLS:auth<github:seaker>;
 use Cro;
 use Test;
 
 if supports-alpn() {
     constant TEST_PORT = 31311;
-    constant %ca := { ca-file => 't/certs-and-keys/ca-crt.pem' };
+    constant %ca := { server-ca-file => 't/certs-and-keys/ca-crt.pem' };
     constant %tls := {
-        private-key-file => 't/certs-and-keys/server-key.pem',
-        certificate-file => 't/certs-and-keys/server-crt.pem'
+        server-private-key-file => 't/certs-and-keys/server-key.pem',
+        server-certificate-file => 't/certs-and-keys/server-crt.pem'
     };
 
     my $application = route {

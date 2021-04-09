@@ -6,14 +6,15 @@
   "authors": [
     "Jonathan Worthington <jnthn@jnthn.net>"
   ],
+  "auth": "github:seaker",
   "depends": [
-    "IO::Socket::Async::SSL",
+    "IO::Socket::Async::SSL:auth<github:seaker>",
     "OO::Monitors",
     "IO::Path::ChildSecure",
     "Base64",
     "HTTP::HPACK",
     "Cro::Core",
-    "Cro::TLS",
+    "Cro::TLS:auth<github:seaker>",
     "JSON::Fast",
     "Crypt::Random",
     "JSON::JWT",
@@ -80,5 +81,5 @@
     "Client",
     "Server"
   ],
-  "source-url": "https://github.com/croservices/cro-http.git"
+  "source-url": "https://github.com/seaker/cro-http.git"
 }

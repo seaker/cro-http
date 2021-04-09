@@ -281,6 +281,12 @@ class Cro::HTTP::Client {
     #| The certificate authority to use for verifying TLS certificates
     has $.ca;
 
+    #| The client certification (file name) issued by the above CA
+    has $.cert;
+
+    #| Client's private key (file name)
+    has $.private-key;
+
     #| The base URI, which will be prepended to all URIs of requests using
     #| URI reference rules (meaning that an absolute URL passed to a
     #| request method with override this completely)

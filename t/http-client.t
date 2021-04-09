@@ -3,16 +3,16 @@ use Base64;
 use Cro::HTTP::Client;
 use Cro::HTTP::Client::CookieJar;
 use Cro::HTTP::Response;
-use Cro::TLS;
+use Cro::TLS:auth<github:seaker>;
 use Test;
 
 constant HTTP_TEST_PORT = 31316;
 constant HTTPS_TEST_PORT = 31317;
 constant PROXY_TEST_PORT = 31318;
-constant %ca := { ca-file => 't/certs-and-keys/ca-crt.pem' };
+constant %ca := { server-ca-file => 't/certs-and-keys/ca-crt.pem' };
 constant %key-cert := {
-    private-key-file => 't/certs-and-keys/server-key.pem',
-    certificate-file => 't/certs-and-keys/server-crt.pem'
+    server-private-key-file => 't/certs-and-keys/server-key.pem',
+    server-certificate-file => 't/certs-and-keys/server-crt.pem'
 };
 
 # Proxy server
@@ -604,7 +604,7 @@ if supports-alpn() {
         ok $resp ~~ Cro::HTTP::Response, 'Got a response back from GET / with HTTPS';
     }
 } else {
-    use Cro::TLS;
+    use Cro::TLS:auth<github:seaker>;
     skip 'No ALPN support', 1;
 }
 
