@@ -1,8 +1,10 @@
 use v6.d;
 use Base64;
 use OO::Monitors;
+use Cro::Policy::Timeout;
 use Cro::HTTP::Client::CookieJar;
 use Cro::HTTP::Internal;
+use Cro::HTTP::Exception;
 use Cro::HTTP::Header;
 use Cro::HTTP::LogTimelineSchema;
 use Cro::HTTP::Request;
@@ -15,6 +17,8 @@ use Cro::HTTP2::ResponseParser;
 use Cro::TCP;
 use Cro::TLS;
 use Cro::Uri;
+use Cro::Iri;
+use Cro::Iri::HTTP;
 use Cro;
 
 my class ResponseParserExtension is ParserExtension {
@@ -34,7 +38,7 @@ class X::Cro::HTTP::Error is Exception {
 
     #| The response phrase in the HTTP response
     method message() {
-        "{$.response.get-response-phrase}"
+        "{$.response.get-response-phrase} ($.request.method() $.request.uri())"
     }
 
     #| The request that resulted in the unsuccessful response.
@@ -92,6 +96,20 @@ class X::Cro::HTTP::Client::InvalidCookie is Exception {
         "Cannot add $!bad.^name() as a cookie (expected a hash of keys to values, " ~
         "or a list of Pair and Cro::HTTP::Cookie objects)"
     }
+}
+
+class X::Cro::HTTP::Client::InvalidTimeoutFormat is Exception {
+    has $.bad;
+    method message() {
+        "Cannot set $!bad.^name() as a timeout (expected a Map of phases or a Real value or an object doing Cro::Policy::Timeout)"
+    }
+}
+
+class Cro::HTTP::Client::Policy::Timeout does Cro::Policy::Timeout[%(
+    connection => 60,
+    headers => 60,
+    body => Inf,
+    total => Inf)] {
 }
 
 #| A HTTP client. Can be used by calling methods on the type object, or by making an
@@ -246,7 +264,7 @@ class Cro::HTTP::Client {
         }
 
         method !key($secure, $host, $port) {
-            "{$secure ?? 'https' !! 'http'}\0$host\0$port\0"
+            "{$secure ?? 'https' !! 'http'}\0$host\0$port"
         }
     }
 
@@ -309,6 +327,9 @@ class Cro::HTTP::Client {
     #| The Proxy URL for a HTTPS request.
     has Cro::Uri $.https-proxy;
 
+    #| Request timeout policy.
+    has Cro::Policy::Timeout $.timeout-policy;
+
     has $!persistent;
     has $!connection-cache = ConnectionCache.new;
 
@@ -327,7 +348,7 @@ class Cro::HTTP::Client {
                     :$http-proxy, :$https-proxy,
                     :$!follow = $DEFAULT-MAX-REDIRECTS, :%!auth, :$!http,
                     :$!persistent = True, :$!ca, :$!push-promises = False,
-                    :$!user-agent = 'Cro') {
+                    :$timeout, :$!user-agent = 'Cro') {
         if $cookie-jar ~~ Bool {
             $!cookie-jar = Cro::HTTP::Client::CookieJar.new;
         }
@@ -345,85 +366,179 @@ class Cro::HTTP::Client {
                 die X::Cro::HTTP::Client::InvalidVersion.new;
             }
         }
-        my sub wrap-uri($uri) {
-            with $uri {
-                when Cro::Uri { $uri }
-                default { Cro::Uri::HTTP.parse(~$uri); }
-            }
+        if $timeout {
+            calculate-timeout($timeout, $!timeout-policy);
         }
-        $!base-uri = wrap-uri($_) with $base-uri;
-        $!http-proxy = wrap-uri($_) with $http-proxy;
-        $!https-proxy = wrap-uri($_) with $https-proxy;
+
+        $!base-uri = self!wrap-uri($_) with $base-uri;
+        $!http-proxy = self!wrap-uri($_) with $http-proxy;
+        $!https-proxy = self!wrap-uri($_) with $https-proxy;
     }
 
-    #| Make a HTTP GET request to the specified URL
+    method !wrap-uri($uri) {
+        with $uri {
+            when Cro::Uri { $uri; }
+            when Cro::Iri { $uri.to-uri; }
+            default { Cro::Iri::HTTP.parse(~$uri).to-uri; }
+        }
+    }
+
+    #| Make a HTTP GET request to the specified URL. Returns a C<Promise>
+    #| that will be kept with a C<Cro::HTTP::Response> if the request is
+    #| successful.
     multi method get($url, %options --> Promise) {
         self.request('GET', $url, %options)
     }
 
-    #| Make a HTTP GET request to the specified URL
+    #| Make a HTTP GET request to the specified URL. Returns a C<Promise>
+    #| that will be kept with a C<Cro::HTTP::Response> if the request is
+    #| successful.
     multi method get($url, *%options --> Promise) {
         self.request('GET', $url, %options)
     }
 
-    #| Make a HTTP HEAD request to the specified URL
+    #| Make a HTTP GET request to the specified URL. Returns a C<Promise>
+    #| that will be kept with the response body if the request is successful.
+    multi method get-body($url, %options --> Promise) {
+        self.request-body('GET', $url, %options)
+    }
+
+    #| Make a HTTP GET request to the specified URL. Returns a C<Promise>
+    #| that will be kept with the response body if the request is successful.
+    multi method get-body($url, *%options --> Promise) {
+        self.request-body('GET', $url, %options)
+    }
+
+    #| Make a HTTP HEAD request to the specified URL. Returns a C<Promise>
+    #| that will be kept with a C<Cro::HTTP::Response> if the request is
+    #| successful.
     multi method head($url, %options --> Promise) {
         self.request('HEAD', $url, %options)
     }
 
-    #| Make a HTTP HEAD request to the specified URL
+    #| Make a HTTP HEAD request to the specified URL. Returns a C<Promise>
+    #| that will be kept with a C<Cro::HTTP::Response> if the request is
+    #| successful.
     multi method head($url, *%options --> Promise) {
         self.request('HEAD', $url, %options)
     }
 
-    #| Make a HTTP POST request to the specified URL
+    #| Make a HTTP POST request to the specified URL. Returns a C<Promise>
+    #| that will be kept with a C<Cro::HTTP::Response> if the request is
+    #| successful.
     multi method post($url, %options --> Promise) {
         self.request('POST', $url, %options)
     }
 
-    #| Make a HTTP POST request to the specified URL
+    #| Make a HTTP POST request to the specified URL. Returns a C<Promise>
+    #| that will be kept with a C<Cro::HTTP::Response> if the request is
+    #| successful.
     multi method post($url, *%options --> Promise) {
         self.request('POST', $url, %options)
     }
 
-    #| Make a HTTP PUT request to the specified URL
+    #| Make a HTTP POST request to the specified URL. Returns a C<Promise>
+    #| that will be kept with the response body if the request is successful.
+    multi method post-body($url, %options --> Promise) {
+        self.request-body('POST', $url, %options)
+    }
+
+    #| Make a HTTP POST request to the specified URL. Returns a C<Promise>
+    #| that will be kept with the response body if the request is successful.
+    multi method post-body($url, *%options --> Promise) {
+        self.request-body('POST', $url, %options)
+    }
+
+    #| Make a HTTP PUT request to the specified URL. Returns a C<Promise>
+    #| that will be kept with a C<Cro::HTTP::Response> if the request is
+    #| successful.
     multi method put($url, %options --> Promise) {
         self.request('PUT', $url, %options)
     }
 
-    #| Make a HTTP PUT request to the specified URL
+    #| Make a HTTP PUT request to the specified URL. Returns a C<Promise>
+    #| that will be kept with a C<Cro::HTTP::Response> if the request is
+    #| successful.
     multi method put($url, *%options --> Promise) {
         self.request('PUT', $url, %options)
     }
 
-    #| Make a HTTP DELETE request to the specified URL
+    #| Make a HTTP PUT request to the specified URL. Returns a C<Promise>
+    #| that will be kept with the response body if the request is successful.
+    multi method put-body($url, %options --> Promise) {
+        self.request-body('PUT', $url, %options)
+    }
+
+    #| Make a HTTP PUT request to the specified URL. Returns a C<Promise>
+    #| that will be kept with the response body if the request is successful.
+    multi method put-body($url, *%options --> Promise) {
+        self.request-body('PUT', $url, %options)
+    }
+
+    #| Make a HTTP DELETE request to the specified URL. Returns a C<Promise>
+    #| that will be kept with a C<Cro::HTTP::Response> if the request is
+    #| successful.
     multi method delete($url, %options --> Promise) {
         self.request('DELETE', $url, %options)
     }
 
-    #| Make a HTTP DELETE request to the specified URL
+    #| Make a HTTP DELETE request to the specified URL. Returns a C<Promise>
+    #| that will be kept with a C<Cro::HTTP::Response> if the request is
+    #| successful.
     multi method delete($url, *%options --> Promise) {
         self.request('DELETE', $url, %options)
     }
 
-    #| Make a HTTP PATCH request to the specified URL
+    #| Make a HTTP DELETE request to the specified URL. Returns a C<Promise>
+    #| that will be kept with the response body if the request is successful.
+    multi method delete-body($url, %options --> Promise) {
+        self.request-body('DELETE', $url, %options)
+    }
+
+    #| Make a HTTP DELETE request to the specified URL. Returns a C<Promise>
+    #| that will be kept with the response body if the request is successful.
+    multi method delete-body($url, *%options --> Promise) {
+        self.request-body('DELETE', $url, %options)
+    }
+
+    #| Make a HTTP PATCH request to the specified URL. Returns a C<Promise>
+    #| that will be kept with a C<Cro::HTTP::Response> if the request is
+    #| successful.
     multi method patch($url, %options --> Promise) {
         self.request('PATCH', $url, %options)
     }
 
-    #| Make a HTTP PATCH request to the specified URL
+    #| Make a HTTP PATCH request to the specified URL. Returns a C<Promise>
+    #| that will be kept with a C<Cro::HTTP::Response> if the request is
+    #| successful.
     multi method patch($url, *%options --> Promise) {
         self.request('PATCH', $url, %options)
     }
 
+    #| Make a HTTP PATCH request to the specified URL. Returns a C<Promise>
+    #| that will be kept with the response body if the request is successful.
+    multi method patch-body($url, %options --> Promise) {
+        self.request-body('PATCH', $url, %options)
+    }
+
+    #| Make a HTTP PATCH request to the specified URL. Returns a C<Promise>
+    #| that will be kept with the response body if the request is successful.
+    multi method patch-body($url, *%options --> Promise) {
+        self.request-body('PATCH', $url, %options)
+    }
+
     #| Make a HTTP request, specifying the HTTP method (GET, POST, etc.),
-    #| the URL, and any further request options.
+    #| the URL, and any further request options. Returns a C<Promise> that
+    #| will be kept with a C<Cro::HTTP::Response> if the request is
+    #| successful.
     multi method request(Str $method, $url, *%options --> Promise) {
         self.request($method, $url, %options)
     }
 
     #| Make a HTTP request, specifying the HTTP method (GET, POST, etc.),
-    #| the URL, and any further request options.
+    #| the URL, and any further request options. Returns a C<Promise> that
+    #| will be kept with a C<Cro::HTTP::Response> if the request is
+    #| successful.
     multi method request(Str $method, $url, %options --> Promise) {
         my $parent = %options<PARENT-REQUEST-LOG>;
         my $request-log = $parent
@@ -433,7 +548,7 @@ class Cro::HTTP::Client {
 
         my $parsed-url = self && $!base-uri
             ?? $!base-uri.add($url)
-            !! Cro::Uri::HTTP.parse($url);
+            !! self!wrap-uri($url);
         my $http = self ?? $!http // %options<http> !! %options<http>;
         with $http {
             unless $_ eq '1.1' || $_ eq '2' || $_ eqv <1.1 2> {
@@ -444,23 +559,35 @@ class Cro::HTTP::Client {
             $http = '';
         }
         my Cro::Uri $proxy-url = self!get-proxy-url($parsed-url);
-        my $request-object = self!assemble-request($method, $parsed-url, $proxy-url, %options);
+        my Cro::Policy::Timeout $timeout-policy;
+        my $request-object = self!assemble-request($method, $parsed-url, $proxy-url, %options, $timeout-policy);
 
         my constant $redirect-codes = set(301, 302, 303, 307, 308);
-        sub construct-url($path) {
-            my $pos = $parsed-url.Str.index('/', 8);
-            $parsed-url.Str.comb[^$pos].join ~ $path;
-        }
         my $enable-push = self ?? $!push-promises // %options<push-promises> !! %options<push-promises>;
 
         Promise(supply {
-            whenever self!get-pipeline($proxy-url // $parsed-url, $http, $request-log, ca => %options<ca>, :$enable-push) -> $pipeline {
+            my $request-start-time = now;
+            my $conn-timeout = $timeout-policy.get-timeout(0, 'connection');
+            whenever self!get-pipeline($proxy-url // $parsed-url, $http, $conn-timeout, $request-log, ca => %options<ca>, :$enable-push) -> $pipeline {
+                # Handle connection persistence.
                 if $pipeline !~~ Pipeline2 {
                     unless self.persistent || $request-object.has-header('connection') {
                         $request-object.append-header('Connection', 'close');
                     }
                 }
+
+                # Set up any timeout for receiving the response headers.
+                my $timeout = $timeout-policy.get-timeout(now - $request-start-time, 'headers');
+                my Bool $headers-kept = False;
+                if $timeout !~~ Inf {
+                    whenever Promise.in($timeout) {
+                        die X::Cro::HTTP::Client::Timeout.new(phase => 'headers', uri => $url) unless $headers-kept;
+                    }
+                }
+
+                # Send the request.
                 whenever $pipeline.send-request($request-object) {
+                    $headers-kept = True;
                     QUIT { $request-log.end }
 
                     # Consider adding the connection back into the cache to use it
@@ -474,9 +601,19 @@ class Cro::HTTP::Client {
                         $pipeline.close;
                     }
 
-                    # Set request object for received response regardless it's correct or not
-                    .request = $request-object;
+                    # If there's a body timeout, enforce it. Note that we need to detach
+                    # this from the current supply, since it outlives it.
+                    my $body-timeout = $timeout-policy.get-timeout(now - $request-start-time, 'body');
+                    if $body-timeout != Inf {
+                        my $response-to-timeout = $_;
+                        Promise.in($body-timeout).then: { $response-to-timeout.cancel }
+                    }
 
+                    # Set request object for received response.
+                    .request = $request-object;
+                    .request.http-version = $pipeline ~~ Pipeline2 ?? '2' !! '1.1';
+
+                    # Pick next steps according to response.
                     if 200 <= .status < 400 || .status == 101 {
                         my $follow;
                         if self {
@@ -490,18 +627,15 @@ class Cro::HTTP::Client {
                                 $request-log.end;
                                 die X::Cro::HTTP::Client::TooManyRedirects.new;
                             }
-                            my $new-method = .status == 302|303 ?? 'GET' !! $method;
+                            my $new-method = .status == 302 | 303 ?? 'GET' !! $method;
                             my %new-opts = %options;
                             %new-opts<follow> = $remain;
-                            if .status == 302|303 {
+                            if .status == 302 | 303 {
                                 %new-opts<body>:delete;
                                 %new-opts<content-type>:delete;
                                 %new-opts<content-length>:delete;
                             }
-                            my $new-url;
-                            $new-url = .header('location').starts-with('/')
-                                       ?? construct-url($_.header('location'))
-                                       !! .header('location');
+                            my $new-url = $parsed-url.add(Cro::Uri::HTTP.parse-ref(.header('location')));
                             %new-opts<PARENT-REQUEST-LOG> = $request-log;
                             Cro::HTTP::LogTimeline::Redirected.log($request-log, :status(.status), :url($new-url));
                             my $req = self.request($new-method, $new-url, %new-opts);
@@ -509,14 +643,16 @@ class Cro::HTTP::Client {
                             whenever $req {
                                 QUIT { $request-log.end; }
                                 $request-log.end;
-                                .emit
+                                .emit;
+                                done;
                             };
                         } else {
                             if self && $.cookie-jar.defined {
                                 $.cookie-jar.add-from-response($_, $parsed-url);
                             }
                             $request-log.end;
-                            .emit
+                            .emit;
+                            done;
                         }
                     } elsif 400 <= .status < 500 {
                         my $auth;
@@ -535,6 +671,7 @@ class Cro::HTTP::Client {
                                 QUIT { $request-log.end; }
                                 $request-log.end;
                                 .emit;
+                                done;
                             };
                         } else {
                             Cro::HTTP::LogTimeline::ErrorResponse.log($request-log, :status(.status));
@@ -549,6 +686,24 @@ class Cro::HTTP::Client {
                 }
             }
         })
+    }
+
+    #| Make a HTTP request, specifying the HTTP method (GET, POST, etc.),
+    #| the URL, and any further request options. Returns a C<Promise> that
+    #| will be kept with the response body if the request is successful.
+    multi method request-body(Str $method, $url, *%options --> Promise) {
+        self.request-body($method, $url, %options)
+    }
+
+    #| Make a HTTP request, specifying the HTTP method (GET, POST, etc.),
+    #| the URL, and any further request options. Returns a C<Promise> that
+    #| will be kept with the response body if the request is successful.
+    multi method request-body(Str $method, $url, %options --> Promise) {
+        # Take care to return the original Promise if it is broken, so we don't
+        # add an extra layer of exception wrapping.
+        my $response = self.request($method, $url, %options);
+        await Promise.anyof($response);
+        $response.status == Kept ?? $response.result.body !! $response
     }
 
     method !get-proxy-url($parsed-url) {
@@ -575,7 +730,7 @@ class Cro::HTTP::Client {
         return False;
     }
 
-    method !get-pipeline(Cro::Uri $url, $http, $log-parent, :$ca, :$enable-push) {
+    method !get-pipeline(Cro::Uri $url, $http, $conn-timeout, $log-parent, :$ca, :$enable-push) {
         my $secure = $url.scheme.lc eq 'https';
         my $host = $url.host;
         my $port = $url.port // ($secure ?? 443 !! 80);
@@ -587,7 +742,7 @@ class Cro::HTTP::Client {
             Promise.kept($pipeline)
         }
         else {
-            self!build-pipeline($secure, $host, $port, $http, $log-parent, :$ca, :$enable-push)
+            self!build-pipeline($secure, $host, $port, $http, $conn-timeout, $log-parent, :$ca, :$enable-push)
         }
     }
 
@@ -607,7 +762,7 @@ class Cro::HTTP::Client {
         }
     }
 
-    method !build-pipeline($secure, $host, $port, $http, $log-parent, :$ca, :$enable-push) {
+    method !build-pipeline($secure, $host, $port, $http, $conn-timeout, $log-parent, :$ca, :$enable-push) {
         my $log-connection = Cro::HTTP::LogTimeline::EstablishConnection.start(
                 $log-parent, :$host, :$port,
                 :secure($secure ?? 'Yes' !! 'No'),
@@ -648,7 +803,7 @@ class Cro::HTTP::Client {
             push @parts, Cro::HTTP2::ResponseParser.new(:$enable-push);
         }
         elsif $http eq '1.1' || !$secure || !$supports-alpn {
-            push @parts, Cro::HTTP::ResponseParser.new;
+            push @parts, Cro::HTTP::ResponseParser.new();
         }
         else {
             push @parts, Cro::ConnectionConditional.new(
@@ -656,7 +811,7 @@ class Cro::HTTP::Client {
                     Cro::HTTP2::FrameParser.new(:client),
                     Cro::HTTP2::ResponseParser.new
                 ],
-                Cro::HTTP::ResponseParser.new
+                Cro::HTTP::ResponseParser.new()
             );
         }
         if self {
@@ -672,10 +827,10 @@ class Cro::HTTP::Client {
         my $in = Supplier::Preserving.new;
         my %ca = self ?? (self.ca // $ca // {}) !! $ca // {};
         my $out = $version-decision
-            ?? establish($connector, $in.Supply, $log-connection, :nodelay, :$host, :$port, |{%tls-config, %ca})
+            ?? establish($connector, $in.Supply, $log-connection, :nodelay, :$host, :$port, :$conn-timeout, |{%tls-config, %ca})
             !! do {
                 my $s = Supplier::Preserving.new;
-                establish($connector, $in.Supply, $log-connection, :nodelay, :$host, :$port, |{%tls-config, %ca}).tap:
+                establish($connector, $in.Supply, $log-connection, :nodelay, :$host, :$port, :$conn-timeout, |{%tls-config, %ca}).tap:
                     { $s.emit($_) },
                     done => { $s.done },
                     quit => {
@@ -691,8 +846,13 @@ class Cro::HTTP::Client {
         }
     }
 
-    sub establish(Cro::Connector $connector, Supply $incoming, $log-connection, *%options) {
+    sub establish(Cro::Connector $connector, Supply $incoming, $log-connection, :$conn-timeout, *%options) {
+        my $connection-obtained = False;
         supply {
+            whenever Promise.in($conn-timeout) {
+                die X::Cro::HTTP::Client::Timeout.new(phase => 'connection', uri => %options<host>) unless $connection-obtained;
+            }
+
             my Promise $connection = $connector.connect(|%options);
             $connection.then({ $log-connection.end });
             whenever $connection -> Cro::Transform $transform {
@@ -703,7 +863,32 @@ class Cro::HTTP::Client {
         }
     }
 
-    method !assemble-request(Str $method, Cro::Uri $base-url, Cro::Uri $proxy-url, %options --> Cro::HTTP::Request) {
+    sub calculate-timeout($value, Cro::Policy::Timeout $timeout-policy is rw) {
+        my $curr-timeout;
+        given $value {
+            when Map:D {
+                my %phases;
+                for $_.kv -> $k, $v {
+                    %phases{$k} = Real($v);
+                }
+                $curr-timeout = Cro::HTTP::Client::Policy::Timeout.new(total => Inf, |%phases);
+            }
+            when Real:D {
+                $curr-timeout = Cro::HTTP::Client::Policy::Timeout.new(total => Real($_));
+            }
+            when Cro::Policy::Timeout:D {
+                $curr-timeout = $_;
+            }
+            default {
+                die X::Cro::HTTP::Client::InvalidTimeoutFormat.new(bad => $_);
+            }
+        }
+        with $curr-timeout {
+            $timeout-policy = $_;
+        }
+    }
+
+    method !assemble-request(Str $method, Cro::Uri $base-url, Cro::Uri $proxy-url, %options, Cro::Policy::Timeout $timeout-policy is rw, --> Cro::HTTP::Request) {
         # Add any query string parameters.
         my $url;
         with %options<query> -> $query {
@@ -777,7 +962,13 @@ class Cro::HTTP::Client {
                     }
                 }
             }
+            when 'timeout' {
+                calculate-timeout($value, $timeout-policy);
+            }
         }
+
+        my $default-timeout = Cro::HTTP::Client::Policy::Timeout.new(:total(Inf));
+        ($timeout-policy = self ?? $!timeout-policy // $default-timeout !! $default-timeout) without $timeout-policy;
 
         # Set User-agent, check if wasn't set already for us
         unless $request.has-header('User-agent') {

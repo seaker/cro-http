@@ -2,6 +2,8 @@ use Cro;
 use Cro::HTTP::Request;
 use Cro::HTTP::Router;
 use Test;
+use lib 't/TestModule';
+use TestModule;
 
 sub body-text(Cro::HTTP::Response $r) {
     $r.body-byte-stream.list.map(*.decode('utf-8')).join
@@ -607,6 +609,12 @@ throws-like { bad-request }, X::Cro::HTTP::Router::OnlyInHandler, what => 'bad-r
             response.append-header('Content-type', 'text/html');
             response.set-body("advent $day".encode('ascii'));
         }
+
+        get -> 'content', *@path where *[*-1].ends-with('.html') {
+            response.status = 200;
+            response.append-header('Content-type', 'text/html');
+            response.set-body("it is html".encode('ascii'));
+        }
     }
     my $source = Supplier.new;
     my $responses = $app.transformer($source.Supply).Channel;
@@ -619,7 +627,9 @@ throws-like { bad-request }, X::Cro::HTTP::Router::OnlyInHandler, what => 'bad-r
         '/tag/pizza', 'tag pizza',
             'Segment constrained by where clause matches when it should',
         '/advent/13', 'advent 13',
-            'Segment of type Int constrained by where clause matches when it should';
+            'Segment of type Int constrained by where clause matches when it should',
+        '/content/foo/bar.html', 'it is html',
+            'Slurpy segment with where clause matches when it could';
     for @good-cases -> $target, $expected-output, $desc {
         my $req = Cro::HTTP::Request.new(:method<GET>, :$target);
         $source.emit($req);
@@ -632,7 +642,8 @@ throws-like { bad-request }, X::Cro::HTTP::Router::OnlyInHandler, what => 'bad-r
         '/product/not-a-uuid', 404, 'Non-matching segment gives 404 error (subset, Str)',
         '/percent/1000', 404, 'Non-matching segment gives 404 error (subset, Int)',
         '/tag/not-valid', 404, 'Non-matching segment gives 404 error (where, Str)',
-        '/advent/25', 404, 'Non-matching segment gives 404 error (where, Int)';
+        '/advent/25', 404, 'Non-matching segment gives 404 error (where, Int)',
+        '/content/foo/bar.jpg', 404, 'Non-matching where clause on slurpy gives 404 error';
     for @bad-cases -> $target, $expected-status, $desc {
         my $req = Cro::HTTP::Request.new(:method<GET>, :$target);
         $source.emit($req);
@@ -1949,68 +1960,62 @@ throws-like { bad-request }, X::Cro::HTTP::Router::OnlyInHandler, what => 'bad-r
 }
 
 {
-    my $app = route {
-        get -> 'index.html' {
-            static-resource 'index.html';
-        }
-        get -> 'test.1' {
-            static-resource 'folder/test.txt';
-        }
-        get -> 'test.2' {
-            static-resource 'folder', 'test.txt';
-        }
-        get -> 'folder-indexes' {
-            static-resource 'folder', :indexes(['test.txt']);
-        }
-        get -> 'root-indexes1' {
-            static-resource '', :indexes(['index.html']);
-        }
-        get -> 'root-indexes2' {
-            static-resource :indexes(['index.html']);
-        }
-    }
+    my $app = resourcey-routes();
     my $source = Supplier.new;
     my $responses = $app.transformer($source.Supply).Channel;
     my $req = Cro::HTTP::Request.new(method => 'GET', target => '/index.html');
     $source.emit($req);
     given $responses.receive -> $r {
-        like body-text($r), rx { '<HTML></HTML>' \n }, 'Get index.html from %*RESOURCES';
-        is $r.status, 200, 'Static-resource sets correct status code';
+        like body-text($r), rx { '<HTML></HTML>' \n }, 'Get index.html from resources';
+        is $r.status, 200, 'resource sets correct status code';
+        is $r.content-type, 'text/html', 'resource sets correct content-type';
     }
 
     $req = Cro::HTTP::Request.new(method => 'GET', target => '/test.1');
     $source.emit($req);
     given $responses.receive -> $r {
-        like body-text($r), rx{ 'this is a test' \n }, 'Get folder/test.txt from %*RESOURCES';
+        like body-text($r), rx{ 'this is a test' \n }, 'Get folder/test.txt from resources';
         is $r.status, 200, 'Good status';
+        is $r.content-type, 'text/plain', 'Good content-type';
     }
 
     $req = Cro::HTTP::Request.new(method => 'GET', target => '/test.2');
     $source.emit($req);
     given $responses.receive -> $r {
-        like body-text($r), rx{ 'this is a test' \n }, 'Get <folder test.txt> from %*RESOURCES';
+        like body-text($r), rx{ 'this is a test' \n }, 'Get <folder test.txt> from resources';
         is $r.status, 200, 'Good status';
+        is $r.content-type, 'text/plain', 'Good content-type';
     }
 
     $req = Cro::HTTP::Request.new(method => 'GET', target => '/folder-indexes');
     $source.emit($req);
     given $responses.receive -> $r {
-        like body-text($r), rx{ 'this is a test' \n }, 'indexes in a folder of %*RESOURCES';
+        like body-text($r), rx{ 'this is a test' \n }, 'indexes in a folder of resources';
         is $r.status, 200, 'Good status';
+        is $r.content-type, 'text/plain', 'Good content-type';
     }
 
     $req = Cro::HTTP::Request.new(method => 'GET', target => '/root-indexes1');
     $source.emit($req);
     given $responses.receive -> $r {
-        like body-text($r), rx{ '<HTML></HTML>' \n } , 'indexes in root of %*RESOURCES, 1';
+        like body-text($r), rx{ '<HTML></HTML>' \n } , 'indexes in root of resources, 1';
         is $r.status, 200, 'Good status';
+        is $r.content-type, 'text/html', 'Good content-type';
     }
 
     $req = Cro::HTTP::Request.new(method => 'GET', target => '/root-indexes2');
     $source.emit($req);
     given $responses.receive -> $r {
-        like body-text($r), rx{ '<HTML></HTML>' \n }, 'indexes in root of %*RESOURCES, 2';
+        like body-text($r), rx{ '<HTML></HTML>' \n }, 'indexes in root of resources, 2';
         is $r.status, 200, 'Good status';
+        is $r.content-type, 'text/html', 'Good content-type';
+    }
+
+    $req = Cro::HTTP::Request.new(method => 'GET', target => '/test-plugin');
+    $source.emit($req);
+    given $responses.receive -> $r {
+        like body-text($r), rx { '<html></html>' \n }, 'The extension point for other plugins wanting to use resources works';
+        is $r.content-type, 'text/html; charset=utf-8', 'Good content-type';
     }
 }
 
@@ -2069,4 +2074,40 @@ throws-like { bad-request }, X::Cro::HTTP::Router::OnlyInHandler, what => 'bad-r
         is $mark, '12345', 'The around blocks are called in top-to-bottom order';
     }
 }
+
+{
+    my $app = route {
+        get -> {
+            response.append-header('Content-type', 'text/plain');
+            content 'text/html', 'foo';
+        }
+    }
+    my $source = Supplier.new;
+    my $responses = $app.transformer($source.Supply).Channel;
+    $source.emit(Cro::HTTP::Request.new(:method<GET>, :target</>));
+    given $responses.receive -> $r {
+        is $r.header('Content-type'), 'text/html; charset=utf-8',
+                'Content-type header set by content replaces any existing one';
+    }
+}
+
+{
+    my $app = route {
+        put -> 'user',  uint32 $id {
+            request-body -> (:$state!, :$comment, *%rest) {
+                 # put user
+            }
+        }
+    }
+    my $source = Supplier.new;
+    my $responses = $app.transformer($source.Supply).Channel;
+    my $req = Cro::HTTP::Request.new(method => 'PUT', target => '/user/20',
+                                     content-type => 'text/plain',
+                                     body => {"state" => "HOM", "comment" => "test"});
+    $source.emit($req);
+    given $responses.receive -> $r {
+        is $r.status, 400, 'Recieved proper status for the case where a capture cannot be unpacked for whatever reason';
+    }
+}
+
 done-testing;

@@ -13,8 +13,14 @@ use Cro::HTTP::Response;
 use Cro::UnhandledErrorReporter;
 use IO::Path::ChildSecure;
 
+class X::Cro::HTTP::Router::OnlyInRouteBlock is Exception {
+    has Str $.what is required;
+    method message() {
+        "Can only use '$!what' inside of a route block"
+    }
+}
 class X::Cro::HTTP::Router::OnlyInHandler is Exception {
-    has $.what;
+    has Str $.what is required;
     method message() {
         "Can only use '$!what' inside of a request handler"
     }
@@ -24,6 +30,18 @@ class X::Cro::HTTP::Router::NoRequestBodyMatch is Exception {
         "None of the request-body matches could handle the body (this exception " ~
         "type is typically caught and handled by Cro to produce a 400 Bad Request " ~
         "error; if you're seeing it, you may have an over-general error handling)"
+    }
+}
+
+class X::Cro::HTTP::Router::ConfusedCapture is Exception {
+    has $.body;
+    has $.content-type;
+    has $.signature;
+
+    method message() {
+        "The message body was parsed into '{ my $text = $!body.raku(); $text.chars > 500 ?? $text.substr(0, 500) ~ '...' !! $text }' of type ($!body.^name()), " ~
+        "but a Block's signature '$!signature.raku()' { $!content-type ?? "for '$!content-type' " !! ' ' }" ~
+        "could not unpack it, check if the signature fits the body?"
     }
 }
 
@@ -45,6 +63,17 @@ module Cro::HTTP::Router {
         $param does Auth;
     }
 
+    #| Router plugins register themselves using the C<router-plugin-register>
+    #| function, receiving in response a plugin key object. This is used to
+    #| identify the plugin in further interactions with the plugin API.
+    class PluginKey {
+       has Str $.id is required;
+    }
+
+    #| A C<Cro::Transform> that consumes HTTP requests and produces HTTP
+    #| responses by routing them according to the routing specification set
+    #| up using the C<route> subroutine other routines. This class itself is
+    #| considered an implementation detail.
     class RouteSet does Cro::Transform {
         role Handler {
             has @.prefix;
@@ -108,8 +137,11 @@ module Cro::HTTP::Router {
         my class RouteHandler does Handler {
             has Str $.method;
             has &.implementation;
+            has Hash[Array, Cro::HTTP::Router::PluginKey] $.plugin-config;
+            has Hash[Array, Cro::HTTP::Router::PluginKey] $.flattened-plugin-config;
 
-            method copy-adding(:@prefix, :@body-parsers!, :@body-serializers!, :@before-matched!, :@after-matched!, :@around!) {
+            method copy-adding(:@prefix, :@body-parsers!, :@body-serializers!, :@before-matched!, :@after-matched!, :@around!,
+                               Hash[Array, Cro::HTTP::Router::PluginKey] :$plugin-config) {
                 self.bless:
                     :$!method, :&!implementation,
                     :prefix[flat @prefix, @!prefix],
@@ -117,16 +149,49 @@ module Cro::HTTP::Router {
                     :body-serializers[flat @!body-serializers, @body-serializers],
                     :before-matched[flat @before-matched, @!before-matched],
                     :after-matched[flat @!after-matched, @after-matched],
-                    :around[flat @!around, @around]
+                    :around[flat @!around, @around],
+                    :$!plugin-config,
+                    :flattened-plugin-config(merge-plugin-config($plugin-config, $!flattened-plugin-config // $!plugin-config))
+            }
+
+            sub merge-plugin-config($outer, $inner) {
+                if $outer && $inner {
+                    # Actually need to merge them.
+                    my Array %merged{Cro::HTTP::Router::PluginKey};
+                    for $inner.kv -> Cro::HTTP::Router::PluginKey $key, @configs {
+                        %merged{$key}.append(@configs);
+                    }
+                    for $outer.kv -> Cro::HTTP::Router::PluginKey $key, @configs {
+                        %merged{$key}.append(@configs);
+                    }
+                    %merged
+                }
+                elsif $inner {
+                    # Nothing new from the outer, so just use inner
+                    $inner
+                }
+                else {
+                    # Only things from the outer
+                    $outer
+                }
             }
 
             method signature() {
                 &!implementation.signature
             }
 
+            method get-innermost-plugin-configs(Cro::HTTP::Router::PluginKey $key --> List) {
+                $!plugin-config{$key}.List // ()
+            }
+
+            method get-plugin-configs(Cro::HTTP::Router::PluginKey $key --> List) {
+                ($!flattened-plugin-config // $!plugin-config){$key}.List // ()
+            }
+
             method !invoke-internal(Cro::HTTP::Request $request, Capture $args --> Promise) {
-                my $*CRO-ROUTER-REQUEST = $request;
-                my $response = my $*CRO-ROUTER-RESPONSE := Cro::HTTP::Response.new(:$request);
+                my $*CRO-ROUTER-REQUEST := $request;
+                my $response := my $*CRO-ROUTER-RESPONSE := Cro::HTTP::Response.new(:$request);
+                my $*CRO-ROUTER-ROUTE-HANDLER := self;
                 self!add-body-parsers($request);
                 self!add-body-serializers($response);
                 start {
@@ -144,6 +209,13 @@ module Cro::HTTP::Router {
                                 $response.status = 400;
                             }
                             when X::Cro::BodyParserSelector::NoneApplicable {
+                                $response.status = 400;
+                            }
+                            when X::Cro::HTTP::Router::ConfusedCapture {
+                                # This is likely a server-side error, but we should not
+                                # leak this to our clients, so just return 400 for anyone
+                                # who passes bad data and report a failure for the developer
+                                report-unhandled-error($_);
                                 $response.status = 400;
                             }
                             default {
@@ -219,6 +291,7 @@ module Cro::HTTP::Router {
         has @.around;
         has $!path-matcher;
         has @!handlers-to-add;  # Closures to defer adding, so they get all the middleware
+        has Array %!plugin-config{Cro::HTTP::Router::PluginKey};
 
         method consumes() { Cro::HTTP::Request }
         method produces() { Cro::HTTP::Response }
@@ -282,7 +355,8 @@ module Cro::HTTP::Router {
 
         method add-handler(Str $method, &implementation --> Nil) {
             @!handlers-to-add.push: {
-                @!handlers.push(RouteHandler.new(:$method, :&implementation, :@!before-matched, :@!after-matched, :@!around));
+                @!handlers.push(RouteHandler.new(:$method, :&implementation, :@!before-matched, :@!after-matched,
+                        :@!around, :%!plugin-config));
             }
         }
 
@@ -327,6 +401,14 @@ module Cro::HTTP::Router {
            }
         }
 
+        method add-plugin-config(Cro::HTTP::Router::PluginKey $key, Any $config --> Nil) {
+            %!plugin-config{$key}.push($config);
+        }
+
+        method get-plugin-configs(Cro::HTTP::Router::PluginKey $key --> List) {
+            (%!plugin-config{$key} // ()).List
+        }
+
         method definition-complete(--> Nil) {
             while @!handlers-to-add.shift -> &add {
                 add();
@@ -338,7 +420,7 @@ module Cro::HTTP::Router {
             for @!includes -> (:@prefix, :$includee) {
                 for $includee.handlers() {
                     @!handlers.push: .copy-adding(:@prefix, :@!body-parsers, :@!body-serializers,
-                        :@!before-matched, :@!after-matched, :@!around);
+                        :@!before-matched, :@!after-matched, :@!around, :%!plugin-config);
                 }
             }
             self!generate-route-matcher();
@@ -448,15 +530,16 @@ module Cro::HTTP::Router {
             }
 
             for @positional.kv -> $seg-index, $param {
+                my @constraints = extract-constraints($param);
                 if $param.slurpy {
                     $segments-terminal = '{} .*:';
+                    $need-sig-bind = True if @constraints;
                 }
                 else {
                     my @matcher-target := $param.optional
                         ?? @segments-optional
                         !! @segments-required;
                     my $type := $param.type;
-                    my @constraints = extract-constraints($param);
                     if $type =:= Mu || $type =:= Any || $type =:= Str {
                         if @constraints == 1 && @constraints[0] ~~ Str:D {
                             # Literal string constraint; matches literally.
@@ -598,6 +681,10 @@ module Cro::HTTP::Router {
             sub extract($v --> Nil) { @constraints.push($v) }
             extract($param.constraints);
             return @constraints;
+        }
+
+        method sink() is hidden-from-backtrace {
+            warn "Useless use of a Cro `route` block in sink context. Did you forget to `include` or `delegate`?";
         }
     }
 
@@ -783,19 +870,35 @@ module Cro::HTTP::Router {
     }
 
     sub run-body-handler(@handlers, \body) {
-        for @handlers {
-            when Block {
-                return .(body) if .signature.ACCEPTS(\(body));
+        for @handlers -> $handler {
+            when $handler ~~ Block {
+                CATCH {
+                    when X::Cannot::Capture {
+                        die X::Cro::HTTP::Router::ConfusedCapture.new(
+                            :body(body),
+                            :content-type(request.content-type),
+                            :signature($handler.signature)) if @handlers.elems == 1;
+                    }
+                }
+                return $handler.(body) if $handler.signature.ACCEPTS(\(body));
             }
-            when Pair {
+            when $handler ~~ Pair {
                 with request.content-type -> $content-type {
-                    if .key eq $content-type.type-and-subtype {
-                        return .value()(body) if .value.signature.ACCEPTS(\(body));
+                    if $handler.key eq $content-type.type-and-subtype {
+                        CATCH {
+                            when X::Cannot::Capture {
+                                die X::Cro::HTTP::Router::ConfusedCapture.new(
+                                    :body(body),
+                                    :$content-type,
+                                    :signature($handler.value.signature));
+                            }
+                        }
+                        return $handler.value()(body) if $handler.value.signature.ACCEPTS(\(body));
                     }
                 }
             }
             default {
-                die "request-body handlers can only be a Block or a Pair, not a $_.^name()";
+                die "request-body handlers can only be a Block or a Pair, not a $handler.^name()";
             }
         }
         die X::Cro::HTTP::Router::NoRequestBodyMatch.new;
@@ -831,9 +934,10 @@ module Cro::HTTP::Router {
     #| body. The body will be serialized using a body serializer. If no request
     #| status was set, it will be set to 200 OK.
     multi content(Str $content-type, $body, :$enc = $body ~~ Str ?? 'utf-8' !! Nil --> Nil) {
-        my $resp = $*CRO-ROUTER-RESPONSE //
+        my Cro::HTTP::Response $resp = $*CRO-ROUTER-RESPONSE //
             die X::Cro::HTTP::Router::OnlyInHandler.new(:what<content>);
         $resp.status //= 200;
+        $resp.remove-header('content-type'); # Multiple content-type headers make no sense
         with $enc {
             $resp.append-header('Content-type', qq[$content-type; charset=$_]);
         }
@@ -1010,12 +1114,14 @@ module Cro::HTTP::Router {
 
     my class BeforeMiddleTransform does Cro::HTTP::Middleware::Conditional {
         has &.block;
+        has $.route-set;
 
         method process(Supply $pipeline --> Supply) {
             supply {
                 whenever $pipeline -> $request {
                     my $*CRO-ROUTER-REQUEST := $request;
                     my $*CRO-ROUTER-RESPONSE := Cro::HTTP::Response.new(:$request);
+                    my $*CRO-MIDDLEWARE-ROUTE-SET = $!route-set;
                     &!block($request);
                     emit $*CRO-ROUTER-RESPONSE.status.defined
                         ?? $*CRO-ROUTER-RESPONSE
@@ -1027,6 +1133,7 @@ module Cro::HTTP::Router {
 
     my class AfterMiddleTransform does Cro::Transform {
         has &.block;
+        has $.route-set;
 
         method consumes() { Cro::HTTP::Response }
         method produces() { Cro::HTTP::Response }
@@ -1035,6 +1142,7 @@ module Cro::HTTP::Router {
             supply {
                 whenever $pipeline -> $response {
                     my $*CRO-ROUTER-RESPONSE := $response;
+                    my $*CRO-MIDDLEWARE-ROUTE-SET = $!route-set;
                     &!block($response);
                     emit $response;
                 }
@@ -1057,7 +1165,7 @@ module Cro::HTTP::Router {
     #| Run the specified block before any routing takes place. If it produces, a
     #| response by itself, then no routing will be performed.
     multi sub before(&middleware --> Nil) is export {
-        my $conditional = BeforeMiddleTransform.new(block => &middleware);
+        my $conditional = BeforeMiddleTransform.new(block => &middleware, route-set => $*CRO-ROUTE-SET);
         $*CRO-ROUTE-SET.add-before($conditional.request);
         $*CRO-ROUTE-SET.add-after($conditional.response);
     }
@@ -1086,7 +1194,7 @@ module Cro::HTTP::Router {
     #| regardless of any route being matched (so if no route matched, this
     #| would get the 404 response to process).
     multi sub after(&middleware --> Nil) is export {
-        my $transformer = AfterMiddleTransform.new(block => &middleware);
+        my $transformer = AfterMiddleTransform.new(block => &middleware, route-set => $*CRO-ROUTE-SET);
         $*CRO-ROUTE-SET.add-after($transformer);
     }
 
@@ -1177,10 +1285,10 @@ module Cro::HTTP::Router {
         %mime{$ext} // %fallback{$ext} // $default;
     }
 
-    #| Serve static content. With a single argument, that file is served. Otherwise,
-    #| the first argument specifies a base path, and the remaining positional
-    #| arguments are treated as path segments. However, it is not possible to
-    #| reach a path above the base.
+    #| Serve static content from a file. With a single argument, that file is
+    #| served. Otherwise, the first argument specifies a base path, and the
+    #| remaining positional arguments are treated as path segments. However,
+    #| it is not possible to reach a path above the base.
     sub static(IO() $base, *@path, :$mime-types, :@indexes) is export {
         my $resp = $*CRO-ROUTER-RESPONSE //
             die X::Cro::HTTP::Router::OnlyInHandler.new(:what<route>);
@@ -1222,32 +1330,136 @@ module Cro::HTTP::Router {
         }
     }
 
-    #| Serve static content from %?RESOURCES
-    sub static-resource(*@path, :$mime-types, :@indexes) is export {
-        my $resp = $*CRO-ROUTER-RESPONSE //
-        die X::Cro::HTTP::Router::OnlyInHandler.new(:what<route>);
+    #| Register a router plugin. The provided ID is for debugging purposes.
+    #| Returns a plugin key object which can be used for further interactions
+    #| with the router plugin infrastructure.
+    sub router-plugin-register(Str $id --> Cro::HTTP::Router::PluginKey) is export(:plugin) {
+        Cro::HTTP::Router::PluginKey.new(:$id)
+    }
 
-        my $path = @path.grep(*.so).join: '/';
-        my %fallback = $mime-types // {};
+    #| Adds an item of configuration to the current `route` block for the
+    #| specified key. This will typically be called by a `sub` implementing
+    #| the router plugin, and attaches configuration for the specified key
+    #| to the object representing the current `route` block. The optional
+    #| C<error-sub> named argument can be used to provide the name of the
+    #| DSL sub called for reporting purposes; it will default to the plugin
+    #| key ID.
+    sub router-plugin-add-config(Cro::HTTP::Router::PluginKey $key, $config, Str :$error-sub = $key.id) is export(:plugin) {
+        with $*CRO-ROUTE-SET {
+            .add-plugin-config($key, $config);
+        }
+        else {
+            die X::Cro::HTTP::Router::OnlyInRouteBlock.new(:what($error-sub));
+        }
+    }
 
-        sub get-extension($path) {
-            return ($path ~~ m/ '.' ( <-[ \. ]>+ ) $ / )[0].Str;
+    #| Get the plugin configuration added for the current route block. This may be
+    #| called both during route setup time and inside of a route handler processing
+    #| a request.
+    sub router-plugin-get-innermost-configs(Cro::HTTP::Router::PluginKey $key, Str :$error-sub = $key.id --> List) is export(:plugin) {
+        with $*CRO-ROUTER-ROUTE-HANDLER {
+            .get-innermost-plugin-configs($key)
+        }
+        orwith $*CRO-ROUTE-SET {
+            .get-plugin-configs($key)
+        }
+        else {
+            die X::Cro::HTTP::Router::OnlyInRouteBlock.new(:what($error-sub));
+        }
+    }
+
+    #| Get the configuration data added for the current route block as well as those
+    #| has been included into. This can only be called in a request handler or a
+    #| before/after middleware block.
+    sub router-plugin-get-configs(Cro::HTTP::Router::PluginKey $key, Str :$error-sub = $key.id --> List) is export(:plugin) {
+        with $*CRO-ROUTER-ROUTE-HANDLER {
+            .get-plugin-configs($key)
+        }
+        orwith $*CRO-MIDDLEWARE-ROUTE-SET {
+            .get-plugin-configs($key)
+        }
+        else {
+            die X::Cro::HTTP::Router::OnlyInHandler.new(:what($error-sub));
+        }
+    }
+
+    my $resources-plugin = router-plugin-register('resource');
+
+    #| Specify the resources hash that calls to the C<resource> sub will use.
+    #| Typically this will be called as C<use-resources %?RESOURCES;>.
+    sub resources-from(%resources --> Nil) is export {
+        router-plugin-add-config($resources-plugin, %resources, error-sub => 'use-resources');
+    }
+
+    #| Provide the response from a resource. Before using this, the C<resources-from>
+    #| sub should be used in the C<route> block in order to associate the correct
+    #| resources hash with the routes. The path parts will be joined with `/`s, and
+    #| a lookup done in the resources hash.
+    sub resource(*@path, :$mime-types, :@indexes --> Nil) is export {
+        # Make sure that we have some resource hash associated with the route block.
+        my @resource-hashes := router-plugin-get-configs($resources-plugin);
+        unless @resource-hashes {
+            die "No resources have been associated with the route block; please add `resources-from %?RESOURCES`";
         }
 
-        if $path && (my $resource = %?RESOURCES{$path}) && $resource.IO !~~ Slip && $resource.IO.e && !$resource.IO.d {
-            content get-mime-or-default(get-extension($path), %fallback), slurp($resource, :bin);
-        } else {
-            for @indexes {
-                my $index = ($path, $_).grep(*.so).join: '/';
-                with %?RESOURCES{$index} {
-                    if .IO !~~ Slip && .IO.e {
-                        content get-mime-or-default(get-extension($index), %fallback), slurp($_, :bin);
-                        last;
+        # Look through the resource hashes.
+        my $path = @path.grep(*.so).join: '/';
+        my %fallback = $mime-types // {};
+        for @resource-hashes {
+            # First for the path.
+            with .{$path} -> $resource {
+                my $io = $resource.IO;
+                if $io !~~ Slip && $io.e && $io.f {
+                    content get-mime-or-default(get-extension($path), %fallback), $resource.slurp(:bin);
+                    return;
+                }
+            }
+
+            # Failing that, we may want an index file.
+            for @indexes -> $index {
+                my $index-path = $path ?? "$path/$index" !! $index;
+                with .{$index-path} -> $resource {
+                    my $io = $resource.IO;
+                    if $io !~~ Slip && $io.e && $io.f {
+                        content get-mime-or-default(get-extension($index-path), %fallback), $resource.slurp(:bin);
+                        return;
                     }
                 }
             }
         }
 
-        $resp.status //= 404;
+        not-found;
+    }
+
+    sub get-basename(Str $path --> Str) {
+        with $path.rindex('/') { $path.substr($_ + 1) } else { $path }
+    }
+
+    sub get-extension(Str $path --> Str) {
+        my $basename = get-basename($path);
+        with $basename.rindex('.') { $basename.substr($_ + 1) } else { '' }
+    }
+
+    #| Resolve a resource in the resources associated with the enclosing route block or the current
+    #| route handler. Exposed for the sake of other plugins that wish to access resources also.
+    sub resolve-route-resource(Str $path, Str :$error-sub = 'resolve-resource' --> IO) is export(:resource-plugin) {
+        route-resource-resolver(:$error-sub)($path)
+    }
+
+    #| Get a resolver that, when invoked with a path, will try to resolve it in
+    #| the resource hashes registered with the route blocks currently in scope.
+    #| (This is especially useful when one wishes to resolve resources as they
+    #| would be in the route block, but in a different dynamic scope.)
+    sub route-resource-resolver(Str :$error-sub = 'route-resource-resolver' --> Code) is export(:resource-plugin) {
+        my @resource-hashes := router-plugin-get-configs($resources-plugin, :$error-sub);
+        sub (Str $path) {
+            for @resource-hashes {
+                my $io = .{$path}.IO;
+                if $io !~~ Slip && $io.e && $io.f {
+                    return $io;
+                }
+            }
+            Nil
+        }
     }
 }
